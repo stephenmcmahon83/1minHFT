@@ -75,7 +75,6 @@ def load_and_audit_csv(file, min_comp_pct, max_gap_min):
     raw = raw[(raw['time'] >= '09:30') & (raw['time'] <= '15:59')].copy()
     raw = raw[~raw['datetime'].duplicated(keep='first')].copy()
     
-    # Remove known VXX reverse split date if present
     if 'VXX' in file.name.upper():
         raw = raw[raw['date'] != pd.to_datetime('2024-08-05').date()].copy()
 
@@ -109,7 +108,6 @@ def load_and_audit_csv(file, min_comp_pct, max_gap_min):
             omit_or += 1
             continue
             
-        # Reindex onto strict 1-minute clock grid (09:30 to 15:59)
         grid_idx = pd.date_range(start=f"{d} 09:30:00", end=f"{d} 15:59:00", freq='1min')
         g_re = grp.set_index('datetime').reindex(grid_idx)
         g_re.index.name = 'datetime'
@@ -148,11 +146,11 @@ def load_and_audit_csv(file, min_comp_pct, max_gap_min):
     df['pv'] = df['typ_price'] * df['Volume_fill']
     df['vwap'] = df.groupby('date')['pv'].cumsum() / df.groupby('date')['Volume_fill'].cumsum().replace(0, np.nan)
     
-    # True clock-minute returns (NaN if either endpoint bar was missing!)
-    df['ret_1m'] = df.groupby('date')['Close_real'].pct_change(1, fill_method=None)
-    df['ret_2m'] = df.groupby('date')['Close_real'].pct_change(2, fill_method=None)
-    df['ret_3m'] = df.groupby('date')['Close_real'].pct_change(3, fill_method=None)
-    df['ret_15m'] = df.groupby('date')['Close_ffill'].pct_change(15, fill_method=None)
+    # True clock-minute returns
+    df['ret_1m'] = df.groupby('date')['Close_real'].pct_change(1)
+    df['ret_2m'] = df.groupby('date')['Close_real'].pct_change(2)
+    df['ret_3m'] = df.groupby('date')['Close_real'].pct_change(3)
+    df['ret_15m'] = df.groupby('date')['Close_ffill'].pct_change(15)
     
     first_opens = raw.groupby('date')['Open'].first()
     df['day_open'] = df['date'].map(first_opens)
@@ -178,7 +176,7 @@ def load_and_audit_csv(file, min_comp_pct, max_gap_min):
     df['orc_low'] = df['date'].map(or_custom['orc_low'])
     df['or_after_time'] = (pd.to_datetime('09:30') + pd.Timedelta(minutes=orb_minutes)).strftime('%H:%M')
     
-    # Strict contiguous 1-minute streaks (any missing minute resets streak to 0)
+    # Strict contiguous 1-minute streaks
     ret1 = df['ret_1m'].values
     is_real = df['is_real_bar'].values
     dates = df['date'].values
@@ -315,9 +313,88 @@ if uploaded_file is not None:
         st.error("No trading days passed the current completeness and max-gap filters. Lower the completeness slider or increase the max allowed gap in the sidebar.")
         st.stop()
 
-    # Build all 7 strategies on the True Clock-Grid DataFrame
+    # ==========================================
+    # BUILD ALL 7 STRATEGIES
+    # ==========================================
     zero_s = pd.Series(False, index=df.index)
-    ex_vwap_l = (df['Close_real'] < df['vwap'] * 0.9970) & (df['ret_15m'] <= -0.0035)
-    ex_vwap_s = (df['Close_real'] > df['vwap'] * 1.0030) & (df['ret_15m'] >= 0.0035)
+    ex_default_l = pd.Series(False, index=df.index)
+    ex_default_s = pd.Series(False, index=df.index)
 
-    # S1: Core VWAP Trend + 3-Bar/IBS Dip Buy (Long-Only)
+    # Strategy 1: Core VWAP Trend + 3-Bar/IBS Dip Buy (Long-Only)
+    s1_long = (df['Close_real'] > df['vwap']) & ((df['d_streak'] >= 2) | (df['ibs'] < 0.15)) & (df['time'] >= '09:45') & (df['time'] <= '15:30')
+    s1_exit = df['Close_real'] >= df['vwap'] * 1.002
+
+    # Strategy 2: VWAP Mean Reversion Fade (Long & Short)
+    s2_long = (df['Close_real'] < df['vwap'] * 0.996) & (df['ret_15m'] <= -0.003) & (df['time'] >= '10:00') & (df['time'] <= '15:15')
+    s2_short = (df['Close_real'] > df['vwap'] * 1.004) & (df['ret_15m'] >= 0.003) & (df['time'] >= '10:00') & (df['time'] <= '15:15')
+
+    # Strategy 3: Momentum Streak Continuation (Long & Short)
+    s3_long = (df['u_streak'] >= 3) & (df['Close_real'] > df['vwap']) & (df['time'] >= '09:45') & (df['time'] <= '15:00')
+    s3_short = (df['d_streak'] >= 3) & (df['Close_real'] < df['vwap']) & (df['time'] >= '09:45') & (df['time'] <= '15:00')
+
+    # Strategy 4: Z-Score Bollinger Reversion (Long & Short)
+    s4_long = (df['z_15'] < -2.0) & (df['time'] >= '10:00') & (df['time'] <= '15:15')
+    s4_short = (df['z_15'] > 2.0) & (df['time'] >= '10:00') & (df['time'] <= '15:15')
+
+    # Strategy 5: Overnight Gap Fade (Long & Short)
+    s5_long = (df['overnight_gap'] < -0.008) & (df['time'] == '09:31')
+    s5_short = (df['overnight_gap'] > 0.008) & (df['time'] == '09:31')
+
+    # Strategy 6: Intraday Momentum Breakout (Long & Short)
+    s6_long = (df['ret_from_open'] > 0.012) & (df['Close_real'] > df['vwap']) & (df['time'] >= '10:00') & (df['time'] <= '14:30')
+    s6_short = (df['ret_from_open'] < -0.012) & (df['Close_real'] < df['vwap']) & (df['time'] >= '10:00') & (df['time'] <= '14:30')
+
+    # Strategy 7: Classic Opening Range Breakout (ORB)
+    s7_long = (df['time'] == df['or_after_time']) & (df['Close_real'] > df['orc_high'])
+    s7_short = (df['time'] == df['or_after_time']) & (df['Close_real'] < df['orc_low'])
+
+    # ==========================================
+    # RUN TOURNAMENT SUITE
+    # ==========================================
+    with st.spinner("Executing 7-strategy simulation tournament..."):
+        t1 = simulate_strategy(df, "S1: VWAP Dip Buy (Long)", s1_long, zero_s, s1_exit, zero_s, default_max_hold, default_sl_pct, default_pt_pct)
+        t2 = simulate_strategy(df, "S2: VWAP Mean Reversion", s2_long, s2_short, zero_s, zero_s, default_max_hold, default_sl_pct, default_pt_pct)
+        t3 = simulate_strategy(df, "S3: Momentum Streak", s3_long, s3_short, zero_s, zero_s, 45, default_sl_pct, default_pt_pct)
+        t4 = simulate_strategy(df, "S4: Z-Score Reversion", s4_long, s4_short, zero_s, zero_s, 60, default_sl_pct, default_pt_pct)
+        t5 = simulate_strategy(df, "S5: Overnight Gap Fade", s5_long, s5_short, zero_s, zero_s, 90, 0.005, 0.005, max_trades_per_day=1)
+        t6 = simulate_strategy(df, "S6: Intraday Trend Breakout", s6_long, s6_short, zero_s, zero_s, default_max_hold, default_sl_pct, default_pt_pct)
+        t7 = simulate_strategy(df, f"S7: {orb_minutes}m ORB", s7_long, s7_short, zero_s, zero_s, 180, default_sl_pct, default_pt_pct)
+
+    all_trades = pd.concat([t1, t2, t3, t4, t5, t6, t7], ignore_index=True)
+
+    if all_trades.empty:
+        st.warning("No trades generated across any strategy with current parameters. Adjust indicators, profit targets, or stop losses.")
+    else:
+        st.subheader("🏆 Strategy Tournament Performance Leaderboard")
+        
+        summary_rows = []
+        for s_name, grp in all_trades.groupby('Strategy'):
+            total_t = len(grp)
+            win_t = len(grp[grp['Net PnL ($)'] > 0])
+            wr = (win_t / total_t) * 100.0 if total_t > 0 else 0.0
+            tot_pnl = grp['Net PnL ($)'].sum()
+            avg_pnl = grp['Net PnL ($)'].mean()
+            max_dd = grp['Running Equity ($)'].min()
+            summary_rows.append({
+                'Strategy': s_name,
+                'Total Trades': total_t,
+                'Win Rate (%)': round(wr, 1),
+                'Total Net PnL ($)': round(tot_pnl, 2),
+                'Avg PnL / Trade ($)': round(avg_pnl, 2),
+                'Ending Equity ($)': round(grp['Running Equity ($)'].iloc[-1], 2)
+            })
+        
+        summary_df = pd.DataFrame(summary_rows).sort_values(by='Total Net PnL ($)', ascending=False).reset_index(drop=True)
+        st.dataframe(summary_df, use_container_width=True)
+
+        st.subheader("📈 Cumulative Equity Curves")
+        eq_piv = all_trades.pivot_table(index='Exit Time', columns='Strategy', values='Running Equity ($)').ffill().fillna(base_trade_size)
+        st.line_chart(eq_piv)
+
+        st.subheader("📋 Trade Ledger Inspector")
+        sel_strat = st.selectbox("Select Strategy to Inspect Ledger", options=all_trades['Strategy'].unique())
+        filtered_trades = all_trades[all_trades['Strategy'] == sel_strat]
+        st.dataframe(filtered_trades, use_container_width=True)
+
+        csv_export = all_trades.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Download Full Trade Ledger (CSV)", data=csv_export, file_name=f"{ticker_name}_7_strategy_trades.csv", mime="text/csv")
